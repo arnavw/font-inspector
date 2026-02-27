@@ -4,10 +4,10 @@ font-inspector is a chrome extension to help satiate my typographic curiosity.
 
 shoutout to claude opus 4.6 for writing this in 5 minutes.
 
-## install locally
+install locally:
 
 ```bash
-git clone https://github.com/arnavwadehra/font-inspector.git
+git clone https://github.com/arnavw/font-inspector.git
 cd font-inspector
 npm install
 npm run build
