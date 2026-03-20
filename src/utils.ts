@@ -41,7 +41,13 @@ export function cleanNameString(s: string): string {
 
 /** Strip quotes and artifacts from CSS font-family values */
 export function cleanFontFamily(raw: string): string {
-  return decodeURIComponent(raw)
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(raw)
+  } catch {
+    decoded = raw
+  }
+  return decoded
     .replace(/"(.+?)"/g, '$1')
     .replace(/'(.+?)'/g, '$1')
     .replace(/\s+\w+=.+(\S|$)/g, '')
@@ -87,12 +93,28 @@ export function mapWeight(value: string | number): { weight: string; weightNum: 
     num = num <= 50 ? 100 : num >= 950 ? 950 : 100 * Math.round(num / 100)
     return { weight: WEIGHT_NUM_TO_NAME[num] || 'Regular', weightNum: num }
   }
+  // Handle weight ranges like "100 900" (variable fonts) — use midpoint for display
+  const rangeMatch = String(value).match(/^(\d+)\s+(\d+)$/)
+  if (rangeMatch) {
+    const mid = Math.round((Number(rangeMatch[1]) + Number(rangeMatch[2])) / 2 / 100) * 100
+    return { weight: WEIGHT_NUM_TO_NAME[mid] || 'Regular', weightNum: mid }
+  }
   const key = String(value).toLowerCase().replace(/[\s-]/g, '')
   if (WEIGHT_NAME_TO_NUM[key] !== undefined) {
     const num = WEIGHT_NAME_TO_NUM[key]
     return { weight: WEIGHT_NUM_TO_NAME[num] || value, weightNum: num }
   }
   return { weight: String(value), weightNum: 400 }
+}
+
+/** Parse a weight value that may be a range (e.g., "100 900" for variable fonts) */
+export function parseWeightRange(weight: string): { min: number; max: number } {
+  const rangeMatch = weight.trim().match(/^(\d+)\s+(\d+)$/)
+  if (rangeMatch) {
+    return { min: Number(rangeMatch[1]), max: Number(rangeMatch[2]) }
+  }
+  const { weightNum } = mapWeight(weight)
+  return { min: weightNum, max: weightNum }
 }
 
 /** Normalize font style to standard values */
@@ -112,7 +134,14 @@ export function formatFullName(family: string, weight: string, style: string): s
 
 /** Create a stable ID from font family + weight + style */
 export function normalizeStyleId(family: string, weight: string, style: string): string {
-  return [family, weight, style, btoa(family).substring(0, 5)]
+  let hash: string
+  try {
+    hash = btoa(family).substring(0, 5)
+  } catch {
+    // btoa throws on non-Latin1 characters (e.g. CJK font names)
+    hash = btoa(encodeURIComponent(family)).substring(0, 5)
+  }
+  return [family, weight, style, hash]
     .map(s => s.replace(/\W+/g, '-').replace(/^-|-$/g, '').toLowerCase())
     .join('_')
 }

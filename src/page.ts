@@ -5,6 +5,7 @@ import opentype from 'opentype.js'
 import {
   cleanFontFamily, cleanFontName, cleanWeight, cleanStyle,
   mapWeight, formatFullName, normalizeStyleId, cleanNameString,
+  parseWeightRange,
 } from './utils'
 import type {
   DetectedFont, FontFaceRule, FontSource, RolloverResult, ElementStyle,
@@ -333,11 +334,36 @@ function findBestSource(sources: FontSource[]): FontSource | null {
 }
 
 function findBestRule(matchingRules: FontFaceRule[], group: StyleGroup): FontFaceRule {
-  return matchingRules.find(r => {
-    const rw = mapWeight(r.weight).weightNum
-    const gw = mapWeight(group.fontWeight).weightNum
-    return rw === gw && cleanStyle(r.style) === cleanStyle(group.fontStyle)
-  }) || matchingRules[0]
+  const gw = mapWeight(group.fontWeight).weightNum
+  const gs = cleanStyle(group.fontStyle)
+
+  // Exact match: weight within range and style matches
+  const exact = matchingRules.find(r => {
+    const range = parseWeightRange(r.weight)
+    return gw >= range.min && gw <= range.max && cleanStyle(r.style) === gs
+  })
+  if (exact) return exact
+
+  // Match style, closest weight
+  const styleMatches = matchingRules.filter(r => cleanStyle(r.style) === gs)
+  if (styleMatches.length > 0) {
+    return styleMatches.reduce((best, r) => {
+      const range = parseWeightRange(r.weight)
+      const bestRange = parseWeightRange(best.weight)
+      const distR = Math.min(Math.abs(gw - range.min), Math.abs(gw - range.max))
+      const distBest = Math.min(Math.abs(gw - bestRange.min), Math.abs(gw - bestRange.max))
+      return distR < distBest ? r : best
+    })
+  }
+
+  // Fallback: closest weight regardless of style
+  return matchingRules.reduce((best, r) => {
+    const range = parseWeightRange(r.weight)
+    const bestRange = parseWeightRange(best.weight)
+    const distR = Math.min(Math.abs(gw - range.min), Math.abs(gw - range.max))
+    const distBest = Math.min(Math.abs(gw - bestRange.min), Math.abs(gw - bestRange.max))
+    return distR < distBest ? r : best
+  })
 }
 
 interface FontBinaryMeta {
@@ -360,40 +386,110 @@ function parseFontBinary(base64: string): FontBinaryMeta | null {
     const font = opentype.parse(buffer)
     const names = font.names
 
-    // Name priority (same as Fonts Ninja module_121)
     const getEn = (field: any): string => {
       if (!field) return ''
       return field.en || Object.values(field)[0] as string || ''
     }
 
-    let fullName = ''
-    const prefFamily = getEn(names.preferredFamily) || getEn(names.fontFamily)
-    const prefSub = getEn(names.preferredSubfamily) || getEn(names.fontSubfamily)
+    const prefFamily = cleanNameString(getEn(names.preferredFamily) || getEn(names.fontFamily))
+    const prefSub = cleanNameString(getEn(names.preferredSubfamily) || getEn(names.fontSubfamily))
+    const rawFullName = cleanNameString(getEn(names.fullName) || '')
 
+    // Build full name for display
+    let fullName = ''
     if (prefFamily && prefSub) {
       fullName = `${prefFamily} ${prefSub}`
     } else if (prefFamily) {
       fullName = prefFamily
     } else {
-      fullName = getEn(names.fullName) || ''
+      fullName = rawFullName
     }
-
-    fullName = cleanNameString(fullName)
     if (!fullName) return null
 
-    const family = cleanFontName(fullName) || fullName
-    const weightStr = cleanWeight(fullName)
+    // Use the family name directly from the name table instead of stripping keywords
+    // from fullName. This avoids destroying family names that contain weight-like words
+    // (e.g., "Black Han Sans", "Medium", "Ultra")
+    const family = prefFamily || cleanFontName(fullName) || fullName
+
+    // Derive weight from subfamily first (most accurate), then OS/2 table, then full name
     const os2Weight = (font.tables as any)?.os2?.usWeightClass
-    const { weight, weightNum } = weightStr
-      ? mapWeight(weightStr)
-      : mapWeight(os2Weight || 400)
-    const style = cleanStyle(fullName)
+    const subWeight = prefSub ? cleanWeight(prefSub) : ''
+    const nameWeight = cleanWeight(fullName)
+    const { weight, weightNum } = subWeight
+      ? mapWeight(subWeight)
+      : os2Weight
+        ? mapWeight(os2Weight)
+        : nameWeight
+          ? mapWeight(nameWeight)
+          : mapWeight(400)
+
+    // Derive style from subfamily first, then full name
+    const style = prefSub ? cleanStyle(prefSub) : cleanStyle(fullName)
     const variable = Boolean((font.tables as any)?.fvar?.axes?.length)
 
     return { fullName, family, weight, weightNum, style, variable }
   } catch {
     return null
   }
+}
+
+// ---- Font rendering verification ----
+
+const GENERIC_FAMILIES = new Set([
+  'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui',
+  'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded', 'emoji', 'math', 'fangsong',
+])
+
+let _fontCheckCtx: CanvasRenderingContext2D | null = null
+
+/** Canvas-based check: is this system font actually installed and rendering? */
+function isSystemFontAvailable(family: string): boolean {
+  if (!_fontCheckCtx) {
+    const canvas = document.createElement('canvas')
+    _fontCheckCtx = canvas.getContext('2d')
+  }
+  if (!_fontCheckCtx) return true // can't check, assume available
+
+  const testString = 'mmmmmmmmmmlli'
+  const testSize = '72px'
+  const fallbacks = ['monospace', 'sans-serif', 'serif']
+
+  return fallbacks.some(fallback => {
+    _fontCheckCtx!.font = `${testSize} ${fallback}`
+    const fallbackWidth = _fontCheckCtx!.measureText(testString).width
+    _fontCheckCtx!.font = `${testSize} "${family}", ${fallback}`
+    const testWidth = _fontCheckCtx!.measureText(testString).width
+    return testWidth !== fallbackWidth
+  })
+}
+
+/** Walk the CSS font-family stack and return the family actually being rendered.
+ *  Uses document.fonts.check() for web fonts and canvas measurement for system fonts. */
+function resolveRenderedFamily(cssFamily: string, rules: FontFaceRule[]): string {
+  const families = cssFamily.split(',').map(f => f.trim())
+  const webFontFamilies = new Set(rules.map(r => r.family.toLowerCase().replace(/['"]/g, '')))
+
+  for (const raw of families) {
+    const clean = raw.replace(/^['"]|['"]$/g, '').trim()
+    const lower = clean.toLowerCase()
+
+    // Generic families are always available
+    if (GENERIC_FAMILIES.has(lower)) return clean
+
+    // Web font declared via @font-face — check if it's actually loaded
+    if (webFontFamilies.has(lower)) {
+      try {
+        if (document.fonts.check(`16px "${clean}"`)) return clean
+      } catch {}
+      continue // web font not loaded, try next in stack
+    }
+
+    // System/local font — verify it's installed via canvas measurement
+    if (isSystemFontAvailable(clean)) return clean
+  }
+
+  // Fallback: return first family
+  return families[0].replace(/^['"]|['"]$/g, '').trim()
 }
 
 // ---- Phase 1: Instant detection (synchronous, <50ms) ----
@@ -452,10 +548,10 @@ function runPhase1(): Phase1Result {
           } catch { /* FontFace injection failed */ }
         }
       } else {
-        // No @font-face match — CSS-only detection
+        // No @font-face match — resolve which family in the stack is actually rendering
         const { weight, weightNum } = mapWeight(group.fontWeight)
-        const rawFamily = group.fontFamily.split(',')[0].trim().replace(/['"]/g, '')
-        const family = cleanFontFamily(rawFamily) || rawFamily
+        const resolvedFamily = resolveRenderedFamily(group.fontFamily, sameOriginRules)
+        const family = cleanFontFamily(resolvedFamily) || resolvedFamily
         font = {
           id: styleId,
           family,
@@ -572,13 +668,20 @@ async function runPhase2({ corsUrls, styleGroups, sameOriginRules, seenFamilies 
       const meta = parseFontBinary(base64)
       if (!meta) continue
 
+      // Use the binary for the family name (most accurate source for the typeface identity),
+      // but use the element's computed weight/style (what the browser actually renders).
+      // This avoids misreporting weight when CSS remaps font files to different weights,
+      // or when variable fonts report a single weight in their name table.
+      const { weight: computedWeight, weightNum: computedWeightNum } = mapWeight(job.group.fontWeight)
+      const computedStyle = cleanStyle(job.group.fontStyle)
+
       const upgradedFont: DetectedFont = {
         id: job.styleId,
         family: meta.family,
-        fullName: formatFullName(meta.family, meta.weight, meta.style),
-        weight: meta.weight,
-        weightNum: meta.weightNum,
-        style: meta.style,
+        fullName: formatFullName(meta.family, computedWeight, computedStyle),
+        weight: computedWeight,
+        weightNum: computedWeightNum,
+        style: computedStyle,
         source: 'binary',
         variable: meta.variable,
         cssFamily: job.group.fontFamily,
